@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Listing Chart</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{--bg:#0d1117;--bg2:#161b22;--border:#30363d;--t1:#e6edf3;--t2:#8b949e;--accent:#58a6ff;--green:#2ea043;--red:#f85149;--yellow:#d29922;--mono:'SF Mono','Cascadia Code',Consolas,monospace;--sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--t1);font-family:var(--sans)}
+body{display:flex;flex-direction:column}
+.hdr{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--border);flex-wrap:wrap}
+.sym{font-size:15px;font-weight:700}.ex{font-size:11px;color:var(--t2);margin-left:6px}
+.ivs{display:flex;gap:4px}
+.iv{padding:4px 10px;font:600 11px var(--mono);background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--t2);cursor:pointer}
+.iv.on{color:var(--accent);border-color:var(--accent)}
+.stats{display:flex;gap:14px;flex-wrap:wrap;padding:8px 12px;font:12px var(--mono);border-bottom:1px solid var(--border)}
+.stats span{color:var(--t2)}.stats b{color:var(--t1);font-weight:600}
+.pos{color:var(--green)!important}.neg{color:var(--red)!important}
+#chart{flex:1;min-height:300px}
+.err{padding:12px;color:var(--red);font-size:12px}
+</style>
+</head>
+<body>
+<div class="hdr">
+  <div><span class="sym" id="sym"></span><span class="ex" id="ex"></span></div>
+  <div class="ivs" id="ivs"></div>
+</div>
+<div class="stats" id="stats"><span>Loading…</span></div>
+<div id="chart"></div>
+<div class="err" id="err"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const SYM = q.get('s') || '', EX = q.get('ex') || 'binance', T = parseInt(q.get('t') || '0', 10);
+const NAME = q.get('n') || SYM.replace(/USDT$/, '');
+const IV_SEC = {'1m': 60, '5m': 300, '15m': 900, '1h': 3600};
+const TZ = -new Date().getTimezoneOffset() * 60;   // show local time on the axis
+let iv = '1m', lastTime = 0;
+
+document.getElementById('sym').textContent = NAME;
+document.getElementById('ex').textContent = EX === 'bybit' ? 'Bybit Perps · ' + SYM : 'Binance Futures · ' + SYM;
+document.title = NAME + ' chart';
+
+const el = document.getElementById('chart');
+const chart = LightweightCharts.createChart(el, {
+  layout: {background: {color: '#0d1117'}, textColor: '#8b949e'},
+  grid: {vertLines: {color: '#1c2333'}, horzLines: {color: '#1c2333'}},
+  timeScale: {timeVisible: true, secondsVisible: false, borderColor: '#30363d'},
+  rightPriceScale: {borderColor: '#30363d'},
+  crosshair: {mode: 0},
+  autoSize: true,
+});
+const candles = chart.addCandlestickSeries({upColor: '#2ea043', downColor: '#f85149', borderVisible: false,
+  wickUpColor: '#2ea043', wickDownColor: '#f85149', priceFormat: {type: 'price', precision: 6, minMove: 0.000001}});
+const volume = chart.addHistogramSeries({priceScaleId: '', priceFormat: {type: 'volume'}});
+volume.priceScale().applyOptions({scaleMargins: {top: 0.82, bottom: 0}});
+let refLine = null;
+
+// Candles come straight from the exchange (both allow browser requests from
+// any site), so this page works from the laptop or from a public static host.
+const BYBIT_IV = {'1m': '1', '5m': '5', '15m': '15', '1h': '60'};
+const VALID = /^[\p{L}\p{N}]{1,30}USDT$/u.test(SYM) && (EX === 'binance' || EX === 'bybit');
+
+async function fetchKlines(interval, limit, startMs) {
+  const conv = k => ({t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]});
+  if (EX === 'bybit') {
+    const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${encodeURIComponent(SYM)}` +
+                `&interval=${BYBIT_IV[interval]}&limit=${Math.min(limit, 1000)}` + (startMs ? `&start=${startMs}` : '');
+    const d = await (await fetch(url)).json();
+    if (d.retCode !== 0) throw new Error(d.retMsg || 'Bybit error');
+    return d.result.list.map(conv).sort((a, b) => a.t - b.t);   // Bybit returns newest first
+  }
+  const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(SYM)}` +
+              `&interval=${interval}&limit=${Math.min(limit, 1500)}` + (startMs ? `&startTime=${startMs}` : '');
+  const d = await (await fetch(url)).json();
+  if (!Array.isArray(d)) throw new Error(d.msg || 'Binance error');
+  return d.map(conv);
+}
+
+// Same maths as compute_pump_stats() in A11_charts.py: reference = close of the
+// last full 1m candle before the announcement minute.
+function computeStats(rows, announceMs) {
+  const annMin = Math.floor(announceMs / 60000) * 60000;
+  const before = rows.filter(k => k.t < annMin), after = rows.filter(k => k.t >= annMin);
+  if (!after.length) return null;
+  const ref = before.length ? before[before.length - 1].c : after[0].o;
+  const high = after.reduce((a, b) => b.h > a.h ? b : a), low = after.reduce((a, b) => b.l < a.l ? b : a);
+  const last = after[after.length - 1].c, pct = x => ref ? (x / ref - 1) * 100 : 0;
+  return {ref, high: high.h, high_pct: pct(high.h), high_t: high.t, low: low.l, low_pct: pct(low.l),
+          last, last_pct: pct(last), minutes: after.length};
+}
+
+const toBar = k => ({time: k.t / 1000 + TZ, open: k.o, high: k.h, low: k.l, close: k.c});
+const toVol = k => ({time: k.t / 1000 + TZ, value: k.v, color: k.c >= k.o ? 'rgba(46,160,67,.5)' : 'rgba(248,81,73,.5)'});
+const fmt = p => Number(p).toPrecision(6).replace(/\.?0+$/, '');
+const pctCls = p => p >= 0 ? 'pos' : 'neg';
+
+function marker() {
+  if (!T) return;
+  const s = IV_SEC[iv];
+  candles.setMarkers([{time: Math.floor(T / 1000 / s) * s + TZ, position: 'aboveBar', color: '#d29922',
+                       shape: 'arrowDown', text: 'Announcement'}]);
+}
+
+async function load() {
+  document.getElementById('err').textContent = '';
+  if (!VALID) { document.getElementById('err').textContent = 'Invalid chart link'; return; }
+  try {
+    const rows = await fetchKlines(iv, 1000);
+    candles.setData(rows.map(toBar));
+    volume.setData(rows.map(toVol));
+    lastTime = rows.length ? rows[rows.length - 1].t : 0;
+    marker();
+    // Zoom to ~60 bars before the announcement through now
+    const annMs = Math.floor(T / 1000 / IV_SEC[iv]) * IV_SEC[iv] * 1000;
+    const idx = T ? rows.findIndex(k => k.t >= annMs) : -1;
+    if (idx >= 0) chart.timeScale().setVisibleLogicalRange({from: Math.max(0, idx - 60), to: rows.length + 3});
+    else chart.timeScale().fitContent();
+  } catch (e) { document.getElementById('err').textContent = 'Chart load failed: ' + e.message; }
+}
+
+async function tick() {
+  if (!VALID) return;
+  try {
+    const rows = await fetchKlines(iv, 2);
+    rows.filter(k => k.t >= lastTime).forEach(k => {
+      candles.update(toBar(k)); volume.update(toVol(k)); lastTime = k.t;
+    });
+  } catch (e) {}
+}
+
+async function stats() {
+  if (!T || !VALID) { document.getElementById('stats').innerHTML = '<span>No announcement time</span>'; return; }
+  try {
+    const s = computeStats(await fetchKlines('1m', 1000, Math.floor(T / 60000) * 60000 - 60000), T);
+    const when = new Date(T).toLocaleString([], {hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short'});
+    if (!s) { document.getElementById('stats').innerHTML = `<span>Announced ${when} - no candles yet</span>`; return; }
+    if (refLine) candles.removePriceLine(refLine);
+    refLine = candles.createPriceLine({price: s.ref, color: '#d29922', lineWidth: 1, lineStyle: 2, title: 'pre'});
+    const ht = new Date(s.high_t).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'});
+    document.getElementById('stats').innerHTML =
+      `<span>Announced <b>${when}</b></span>` +
+      `<span>Pre <b>$${fmt(s.ref)}</b></span>` +
+      `<span>High <b class="${pctCls(s.high_pct)}">$${fmt(s.high)} (${s.high_pct >= 0 ? '+' : ''}${s.high_pct.toFixed(1)}%)</b> @ ${ht}</span>` +
+      `<span>Low <b class="${pctCls(s.low_pct)}">${s.low_pct >= 0 ? '+' : ''}${s.low_pct.toFixed(1)}%</b></span>` +
+      `<span>Now <b class="${pctCls(s.last_pct)}">$${fmt(s.last)} (${s.last_pct >= 0 ? '+' : ''}${s.last_pct.toFixed(1)}%)</b></span>` +
+      (s.minutes >= 1000 ? '<span>(stats cover first ~16h)</span>' : '');
+  } catch (e) { document.getElementById('stats').innerHTML = '<span>Stats unavailable</span>'; }
+}
+
+const ivBox = document.getElementById('ivs');
+Object.keys(IV_SEC).forEach(k => {
+  const b = document.createElement('button');
+  b.className = 'iv' + (k === iv ? ' on' : ''); b.textContent = k;
+  b.onclick = () => { iv = k; document.querySelectorAll('.iv').forEach(x => x.classList.toggle('on', x === b)); load(); };
+  ivBox.appendChild(b);
+});
+
+load(); stats();
+setInterval(tick, 3000);
+setInterval(stats, 15000);
+</script>
+</body>
+</html>
