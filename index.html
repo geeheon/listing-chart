@@ -20,9 +20,15 @@ body{display:flex;flex-direction:column}
 .pos{color:var(--green)!important}.neg{color:var(--red)!important}
 #chart{flex:1;min-height:300px}
 .err{padding:12px;color:var(--red);font-size:12px}
+.tabs{display:none;padding:0 8px;background:var(--bg2);border-bottom:1px solid var(--border);overflow-x:auto;scrollbar-width:none;white-space:nowrap}
+.tabs.vis{display:block}.tabs::-webkit-scrollbar{display:none}
+.tab{display:inline-block;padding:8px 12px;font-size:12px;font-weight:600;color:var(--t2);cursor:pointer;border-bottom:2px solid transparent}
+.tab.on{color:var(--accent);border-bottom-color:var(--accent)}
+.tab .tp{font:11px var(--mono);margin-left:6px}
 </style>
 </head>
 <body>
+<div class="tabs" id="tabs"></div>
 <div class="hdr">
   <div><span class="sym" id="sym"></span><span class="ex" id="ex"></span></div>
   <div class="ivs" id="ivs"></div>
@@ -32,16 +38,21 @@ body{display:flex;flex-direction:column}
 <div class="err" id="err"></div>
 <script>
 const q = new URLSearchParams(location.search);
-const SYM = q.get('s') || '', EX = q.get('ex') || 'binance', T = parseInt(q.get('t') || '0', 10);
-const NAME = q.get('n') || SYM.replace(/USDT$/, '');
+const T = parseInt(q.get('t') || '0', 10);
+const okCoin = c => /^[\p{L}\p{N}]{1,30}USDT$/u.test(c.sym) && (c.ex === 'binance' || c.ex === 'bybit');
+// Multi-coin listing: c=ENAUSDT~binance~ENA,1000PEPEUSDT~binance~PEPE ; single: s=..&ex=..&n=..
+const COINS = (q.get('c')
+  ? q.get('c').split(',').map(x => { const [sym, ex, name] = x.split('~'); return {sym: sym || '', ex: ex || 'binance', name: name || ''}; })
+  : [{sym: q.get('s') || '', ex: q.get('ex') || 'binance', name: q.get('n') || ''}]
+).map(c => ({...c, name: c.name || c.sym.replace(/USDT$/, '')})).filter(okCoin).slice(0, 12);
+let cur = 0, gen = 0;                       // gen: bumped on tab switch so stale responses are dropped
+let SYM = '', EX = 'binance', NAME = '';
+const VALID = COINS.length > 0;
 const IV_SEC = {'1m': 60, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600,
                 '2h': 7200, '4h': 14400, '12h': 43200, '1d': 86400};
 const TZ = -new Date().getTimezoneOffset() * 60;   // show local time on the axis
 let iv = '1m', lastTime = 0;
 
-document.getElementById('sym').textContent = NAME;
-document.getElementById('ex').textContent = EX === 'bybit' ? 'Bybit Perps · ' + SYM : 'Binance Futures · ' + SYM;
-document.title = NAME + ' chart';
 
 const el = document.getElementById('chart');
 const chart = LightweightCharts.createChart(el, {
@@ -62,9 +73,9 @@ let refLine = null;
 // any site), so this page works from the laptop or from a public static host.
 const BYBIT_IV = {'1m': '1', '5m': '5', '15m': '15', '30m': '30', '1h': '60',
                   '2h': '120', '4h': '240', '12h': '720', '1d': 'D'};
-const VALID = /^[\p{L}\p{N}]{1,30}USDT$/u.test(SYM) && (EX === 'binance' || EX === 'bybit');
 
-async function fetchKlines(interval, limit, startMs) {
+async function fetchKlines(interval, limit, startMs, coin) {
+  const SYM = (coin || COINS[cur]).sym, EX = (coin || COINS[cur]).ex;
   const conv = k => ({t: +k[0], o: +k[1], h: +k[2], l: +k[3], c: +k[4], v: +k[5]});
   if (EX === 'bybit') {
     const url = `https://api.bybit.com/v5/market/kline?category=linear&symbol=${encodeURIComponent(SYM)}` +
@@ -108,8 +119,10 @@ function marker() {
 async function load() {
   document.getElementById('err').textContent = '';
   if (!VALID) { document.getElementById('err').textContent = 'Invalid chart link'; return; }
+  const g = gen;
   try {
     const rows = await fetchKlines(iv, 1000);
+    if (g !== gen) return;
     candles.setData(rows.map(toBar));
     volume.setData(rows.map(toVol));
     lastTime = rows.length ? rows[rows.length - 1].t : 0;
@@ -125,7 +138,8 @@ async function load() {
 async function tick() {
   if (!VALID) return;
   try {
-    const rows = await fetchKlines(iv, 2);
+    const g = gen, rows = await fetchKlines(iv, 2);
+    if (g !== gen) return;
     rows.filter(k => k.t >= lastTime).forEach(k => {
       candles.update(toBar(k)); volume.update(toVol(k)); lastTime = k.t;
     });
@@ -134,6 +148,7 @@ async function tick() {
 
 async function stats() {
   if (!T || !VALID) { document.getElementById('stats').innerHTML = '<span>No announcement time</span>'; return; }
+  const g = gen;
   try {
     // High/low from 1m candles, paged: 5 x 1500 (Binance, ~5 days) or 5 x 1000 (Bybit, ~3.5 days)
     const page = EX === 'bybit' ? 1000 : 1500;
@@ -150,6 +165,7 @@ async function stats() {
       const live = await fetchKlines('1m', 1);
       if (live.length) { s.last = live[live.length - 1].c; s.last_pct = s.ref ? (s.last / s.ref - 1) * 100 : 0; }
     }
+    if (g !== gen) return;
     const when = new Date(T).toLocaleString([], {hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short'});
     if (!s) { document.getElementById('stats').innerHTML = `<span>Announced ${when} - no candles yet</span>`; return; }
     if (refLine) candles.removePriceLine(refLine);
@@ -173,9 +189,65 @@ Object.keys(IV_SEC).forEach(k => {
   ivBox.appendChild(b);
 });
 
-load(); stats();
-setInterval(tick, 3000);
-setInterval(stats, 15000);
+// Tabs (only shown for multi-coin listings): live % vs each coin's pre-announcement price
+const refCache = {};
+async function tabPcts() {
+  if (COINS.length < 2 || !T) return;
+  await Promise.all(COINS.map(async (c, i) => {
+    try {
+      if (refCache[i] === undefined) {
+        const s = computeStats(await fetchKlines('1m', 3, Math.floor(T / 60000) * 60000 - 60000, c), T);
+        refCache[i] = s ? s.ref : null;
+      }
+      const live = await fetchKlines('1m', 1, null, c);
+      const el = document.getElementById('tp' + i);
+      if (refCache[i] && live.length && el) {
+        const p = (live[live.length - 1].c / refCache[i] - 1) * 100;
+        el.textContent = (p >= 0 ? '+' : '') + p.toFixed(1) + '%';
+        el.className = 'tp ' + pctCls(p);
+      }
+    } catch (e) {}
+  }));
+}
+
+function selectCoin(i) {
+  cur = i; gen++;
+  const c = COINS[i];
+  SYM = c.sym; EX = c.ex; NAME = c.name;
+  document.getElementById('sym').textContent = NAME;
+  document.getElementById('ex').textContent = (EX === 'bybit' ? 'Bybit Perps · ' : 'Binance Futures · ') + SYM;
+  document.title = NAME + ' chart';
+  document.querySelectorAll('.tab').forEach((t, j) => t.classList.toggle('on', j === i));
+  if (refLine) { candles.removePriceLine(refLine); refLine = null; }
+  candles.setMarkers([]); candles.setData([]); volume.setData([]);
+  document.getElementById('stats').innerHTML = '<span>Loading…</span>';
+  lastTime = 0;
+  load(); stats();
+}
+
+if (COINS.length > 1) {
+  const tabs = document.getElementById('tabs');
+  tabs.classList.add('vis');
+  COINS.forEach((c, i) => {
+    const t = document.createElement('span');
+    t.className = 'tab';
+    t.innerHTML = '<span></span><span class="tp" id="tp' + i + '"></span>';
+    t.firstChild.textContent = c.name;          // textContent: names come from the URL
+    t.onclick = () => selectCoin(i);
+    tabs.appendChild(t);
+  });
+}
+
+if (VALID) {
+  selectCoin(Math.min(Math.max(parseInt(q.get('i') || '0', 10) || 0, 0), COINS.length - 1));
+  tabPcts();
+  setInterval(tick, 3000);
+  setInterval(stats, 15000);
+  setInterval(tabPcts, 15000);
+} else {
+  document.getElementById('err').textContent = 'Invalid chart link';
+  document.getElementById('stats').innerHTML = '<span>No chart</span>';
+}
 </script>
 </body>
 </html>
