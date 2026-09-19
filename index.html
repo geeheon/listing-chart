@@ -12,8 +12,8 @@ html,body{height:100%;background:var(--bg);color:var(--t1);font-family:var(--san
 body{display:flex;flex-direction:column}
 .hdr{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:var(--bg2);border-bottom:1px solid var(--border);flex-wrap:wrap}
 .sym{font-size:15px;font-weight:700}.ex{font-size:11px;color:var(--t2);margin-left:6px}
-.ivs{display:flex;gap:4px}
-.iv{padding:4px 10px;font:600 11px var(--mono);background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--t2);cursor:pointer}
+.ivs{display:flex;gap:4px;flex-wrap:wrap}
+.iv{padding:4px 8px;font:600 11px var(--mono);background:var(--bg);border:1px solid var(--border);border-radius:4px;color:var(--t2);cursor:pointer}
 .iv.on{color:var(--accent);border-color:var(--accent)}
 .stats{display:flex;gap:14px;flex-wrap:wrap;padding:8px 12px;font:12px var(--mono);border-bottom:1px solid var(--border)}
 .stats span{color:var(--t2)}.stats b{color:var(--t1);font-weight:600}
@@ -34,7 +34,8 @@ body{display:flex;flex-direction:column}
 const q = new URLSearchParams(location.search);
 const SYM = q.get('s') || '', EX = q.get('ex') || 'binance', T = parseInt(q.get('t') || '0', 10);
 const NAME = q.get('n') || SYM.replace(/USDT$/, '');
-const IV_SEC = {'1m': 60, '5m': 300, '15m': 900, '1h': 3600};
+const IV_SEC = {'1m': 60, '5m': 300, '15m': 900, '30m': 1800, '1h': 3600,
+                '2h': 7200, '4h': 14400, '12h': 43200, '1d': 86400};
 const TZ = -new Date().getTimezoneOffset() * 60;   // show local time on the axis
 let iv = '1m', lastTime = 0;
 
@@ -59,7 +60,8 @@ let refLine = null;
 
 // Candles come straight from the exchange (both allow browser requests from
 // any site), so this page works from the laptop or from a public static host.
-const BYBIT_IV = {'1m': '1', '5m': '5', '15m': '15', '1h': '60'};
+const BYBIT_IV = {'1m': '1', '5m': '5', '15m': '15', '30m': '30', '1h': '60',
+                  '2h': '120', '4h': '240', '12h': '720', '1d': 'D'};
 const VALID = /^[\p{L}\p{N}]{1,30}USDT$/u.test(SYM) && (EX === 'binance' || EX === 'bybit');
 
 async function fetchKlines(interval, limit, startMs) {
@@ -133,7 +135,21 @@ async function tick() {
 async function stats() {
   if (!T || !VALID) { document.getElementById('stats').innerHTML = '<span>No announcement time</span>'; return; }
   try {
-    const s = computeStats(await fetchKlines('1m', 1000, Math.floor(T / 60000) * 60000 - 60000), T);
+    // High/low from 1m candles, paged: 5 x 1500 (Binance, ~5 days) or 5 x 1000 (Bybit, ~3.5 days)
+    const page = EX === 'bybit' ? 1000 : 1500;
+    let start = Math.floor(T / 60000) * 60000 - 60000, rows = [];
+    for (let p = 0; p < 5; p++) {
+      const batch = await fetchKlines('1m', page, start);
+      rows = rows.concat(batch.filter(k => !rows.length || k.t > rows[rows.length - 1].t));
+      if (batch.length < page) break;
+      start = batch[batch.length - 1].t + 60000;
+    }
+    const s = computeStats(rows, T);
+    const coveredToEnd = rows.length && rows[rows.length - 1].t >= Date.now() - 180000;
+    if (s) {   // "Now" is always the live price, even beyond the paged window
+      const live = await fetchKlines('1m', 1);
+      if (live.length) { s.last = live[live.length - 1].c; s.last_pct = s.ref ? (s.last / s.ref - 1) * 100 : 0; }
+    }
     const when = new Date(T).toLocaleString([], {hour: '2-digit', minute: '2-digit', day: '2-digit', month: 'short'});
     if (!s) { document.getElementById('stats').innerHTML = `<span>Announced ${when} - no candles yet</span>`; return; }
     if (refLine) candles.removePriceLine(refLine);
@@ -145,7 +161,7 @@ async function stats() {
       `<span>High <b class="${pctCls(s.high_pct)}">$${fmt(s.high)} (${s.high_pct >= 0 ? '+' : ''}${s.high_pct.toFixed(1)}%)</b> @ ${ht}</span>` +
       `<span>Low <b class="${pctCls(s.low_pct)}">${s.low_pct >= 0 ? '+' : ''}${s.low_pct.toFixed(1)}%</b></span>` +
       `<span>Now <b class="${pctCls(s.last_pct)}">$${fmt(s.last)} (${s.last_pct >= 0 ? '+' : ''}${s.last_pct.toFixed(1)}%)</b></span>` +
-      (s.minutes >= 1000 ? '<span>(stats cover first ~16h)</span>' : '');
+      (coveredToEnd ? '' : `<span>(high/low cover the first ${(s.minutes / 1440).toFixed(1)} days)</span>`);
   } catch (e) { document.getElementById('stats').innerHTML = '<span>Stats unavailable</span>'; }
 }
 
